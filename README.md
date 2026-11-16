@@ -175,32 +175,21 @@ python run.py judge --input artifacts/run-v1/privacy_dataset.jsonl --scope final
 | `summary.json` | 完成数量、失败或歧义数量、调用统计 |
 | `config.snapshot.json`、`prompts/`、`cache_index.json` | 本次判分配置、提示词快照和缓存索引 |
 
-`summary.json` 中 `complete=true` 表示全部抽样文本都有明确的参考标签。如果只有 `ok` 和 `needs_review` 两种状态，也可以继续评估：只统计判分明确的记录，将仍有歧义的记录计为 GPT 弃权，保留原始抽样文件。此时 `complete` 仍为 `false`，`judge` 命令会返回退出码 2，但可以单独运行下面的评分命令，无需再次请求 GPT：
+`summary.json` 中 `complete=true` 表示全部抽样文本都有明确的参考标签。如果只有 `ok` 和 `needs_review` 两种状态，也可以继续评估：只统计判分明确的记录，将仍有歧义的记录计为 GPT 弃权，保留原始抽样文件。
+
+此时 `complete` 仍为 `false`，`judge` 命令会返回退出码 2，但可以单独运行下面的评分命令：
 
 ```bash
 python run.py evaluate --predictions artifacts/run-v1/predictions.jsonl --gold artifacts/judge-final-v1/judgments.jsonl --output artifacts/run-v1/evaluation/metrics-final-gpt.json
 ```
 
-输出相对于 GPT 参考标签的文本有效率、标签精确率和标签集合完全一致率。指标带有 `reference_kind=llm_judge`、`reference_is_human=false`，不作为人工标注准确率；仅抽取最终正例也无法计算总体召回率或 F1。沿用的字段名 `gold_labels` 和参数名 `--gold` 在这里表示模型参考标签。
-
-评估文件同时记录原始抽样数、实际评分数和弃权情况。例如，50 条样本中有 47 条判分明确、3 条仍有歧义时：
-
-| 字段 | 含义 | 示例值 |
-|---|---|---:|
-| `sample_size` | 原始抽样文本数 | 50 |
-| `evaluated_count` | 实际参与指标计算的文本数 | 47 |
-| `judge_coverage` | 明确判分数 / 原始抽样数 | 0.94（94%） |
-| `judge_abstained_count` | GPT 因歧义弃权的文本数 | 3 |
-| `judge_abstention_rate` | GPT 弃权比例 | 0.06（6%） |
-
-此时文本有效率和集合一致率的分母为 47，标签精确率也只汇总这 47 条中的标签。**报告指标时须同时写明 94% 的判分覆盖率和 3 条弃权，不能将指标当作全部 50 条的结果。** 弃权文本可能更难判断，因此也不能据此假定它们与已评分文本表现相同。`judge_abstentions` 保存弃权记录的 ID 和原因，`metrics_scope=resolved_judgments_only` 标明指标范围；若全部弃权，各项质量比率为 `null`。
-
-GPT 仍可能误判，来源真实性由第 7 步核验。判分不改写原始抽取结果，也不填写人工标注耗时或来源核验结论。请求固定 `store=false`，本地仍保留响应缓存用于续跑和复现；这不代表对第三方网关日志策略的保证。判分不使用网页搜索，避免引入原文之外的信息。
+输出相对于 GPT 参考标签的**文本有效率、标签精确率和标签集合完全一致率**。
 
 ## 9. LLM-as-a-Judge 评估独立测试集
 
-使用第 5 步保留的 100 条测试文本，包含正例与负例。GPT 判分会处理全部抽样文本，不使用 DeepSeek 的规则过滤：
+使用第 5 步保留的 100 条测试文本，GPT 判分会处理全部抽样文本：
 
+> Windows & Linux
 ```bash
 python run.py judge --input data/prepared/splits-v1/test/input.jsonl --scope holdout --count 100 --seed 3602 --output artifacts/judge-test-v1 --cache artifacts/judge-cache-v1 --mode resume
 ```
@@ -212,43 +201,20 @@ python run.py run --prepared data/prepared/splits-v1/test --config artifacts/run
 python run.py evaluate --predictions artifacts/test-v1/predictions.jsonl --gold artifacts/judge-test-v1/judgments.jsonl --output artifacts/run-v1/evaluation/metrics-test-gpt.json
 ```
 
-`metrics-test-gpt.json` 包含相对于 GPT 参考标签的 Micro Precision、Recall、F1、各类别指标和标签集合完全一致率。分母为零时返回 `null`。这些结果衡量两个模型在固定标签规范下的差异，不等于人工验证后的真实准确率。
-
-测试配置须保持 `target_count=0`，测试集不用于调参。对 GPT 已明确判分的文本，抽取端的 `needs_review` 作为无预测标签处理，参考标签中的对应类别计为漏检；`abstained_count` 记录这些抽取端弃权。GPT 判分端的 `needs_review` 则由 `judge_abstained_count` 单独统计，不参与质量指标计算，也不当作负例。测试集同样须同时报告判分覆盖率、弃权数和实际评分数，指标仅适用于明确判分的子集。
-
-拒答、无效证据、预算耗尽或其他失败不属于上述歧义弃权，仍会阻止评分。评分也会校验弃权记录的文本、来源、证据和预测是否完整，不通过删除记录来绕过检查。
-
-### GPT 判分续跑与离线复现
-
-判分输出目录必须是新目录。中断或预算耗尽后，保留 `judge-cache-v1`，以原配置、提示词和抽样参数重跑：
-
-```bash
-python run.py judge --input artifacts/run-v1/privacy_dataset.jsonl --scope final --count 50 --seed 3602 --config artifacts/judge-final-v1/config.snapshot.json --prompts artifacts/judge-final-v1/prompts --output artifacts/judge-final-v2 --cache artifacts/judge-cache-v1 --mode resume
-```
-
-每次执行重新计算请求次数额度，默认上限 1,500，初次判断、复核、修复和 HTTP 重试共用这份额度。续跑可能继续产生费用；已缓存的错误响应不会因重跑自动变正确，持续歧义或校验失败需要检查提示词、输出长度等设置后，使用新目录记录修订实验。
-
-缓存完整时，将 `--mode resume` 改成 `--mode replay` 并使用新输出目录，即可离线重放判分。参考标签、证据和请求轨迹应一致，`judge_seconds` 等耗时可以不同；`compare` 命令只用于第 10 步的抽取结果，不用于判分目录。测试集判分续跑时对应替换输入路径、`scope=holdout`、`count=100` 和快照目录。使用新判分结果后，`evaluate --gold` 也要指向新的 `judgments.jsonl`。
+`metrics-test-gpt.json` 包含相对于 GPT 参考标签的 Micro Precision、Recall、F1、各类别指标和标签集合完全一致率。
 
 ## 10. 离线重放并比较结果
 
-Windows（PowerShell）：
+> Windows & Linux
 
-```powershell
+```bash
 python run.py run --prepared data/prepared/splits-v1/collection --config artifacts/run-v1/config.snapshot.json --prompts artifacts/run-v1/prompts --output artifacts/replay-v1 --cache artifacts/cache-v1 --mode replay
 python run.py compare artifacts/run-v1 artifacts/replay-v1
 ```
 
-Linux（Bash）：
+`replay` 只读取缓存，不需要 API Key。它重新执行解析、校验和导出；缺少缓存时会报错。
 
-```bash
-python3 run.py run --prepared data/prepared/splits-v1/collection --config artifacts/run-v1/config.snapshot.json --prompts artifacts/run-v1/prompts --output artifacts/replay-v1 --cache artifacts/cache-v1 --mode replay
-python3 run.py compare artifacts/run-v1 artifacts/replay-v1
-```
-
-`replay` 只读取缓存，不需要 API Key，也不联网。它重新执行解析、校验和导出；缺少缓存时会报错。
-
-使用相同代码、输入、配置及提示词时，比较结果应为 `"identical_bytes": true`，表示最终 `privacy_dataset.jsonl` 逐字节一致。耗时、缓存命中等运行统计可以不同。若正式运行尚有未处理记录，应先完成运行再重放。
+使用相同代码、输入、配置及提示词时，比较结果应为 `"identical_bytes": true`，表示最终 `privacy_dataset.jsonl` 逐字节一致。耗时、缓存命中等运行统计可以不同。
 
 ---
 
@@ -260,25 +226,6 @@ python3 run.py compare artifacts/run-v1 artifacts/replay-v1
 | 需要从头下载 | 在 `download` 命令后加 `--restart`，程序先备份旧片段 |
 | 完整 ZIP 校验失败 | 保留文件，换输出路径重新下载或传输 |
 | `prepare`、`split`、`run` 或 `judge` 提示输出目录已存在 | 换用新目录，例如将 `v1` 改成 `v2` |
-| API 鉴权失败 | 检查 `.env` 和同名环境变量；环境变量优先 |
 | 运行中断或出现 `unprocessed_budget` | 使用原缓存、新输出目录，以 `resume` 模式重跑 |
 | `replay` 缺少缓存 | 找回该次运行的完整缓存，或用 `resume` 补充模型调用后重新核验 |
 | 数量或类别不足 | 扩大原始输入范围，重新准备和运行，再核验结果 |
-
-例如，继续使用 `run-v1` 的配置、提示词和已完成缓存：
-
-Windows（PowerShell）：
-
-```powershell
-python run.py run --prepared data/prepared/splits-v1/collection --config artifacts/run-v1/config.snapshot.json --prompts artifacts/run-v1/prompts --output artifacts/run-v2 --cache artifacts/cache-v1 --mode resume
-```
-
-Linux（Bash）：
-
-```bash
-python3 run.py run --prepared data/prepared/splits-v1/collection --config artifacts/run-v1/config.snapshot.json --prompts artifacts/run-v1/prompts --output artifacts/run-v2 --cache artifacts/cache-v1 --mode resume
-```
-
-命中缓存的请求直接复用，其余继续调用 API。请求预算按每次执行重新计数，可能继续产生费用。后续核验、评估和比较命令中的正式运行目录也要改为 `artifacts/run-v2`。
-
-如果需要重新请求模型做对照实验，使用新输出目录、新缓存目录和 `--mode fresh`；重新调用模型可能得到不同结果。
