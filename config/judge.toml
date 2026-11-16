@@ -1,0 +1,16 @@
+# Independent GPT reference labels; keep credentials in .env only.
+[judge]
+endpoint = "https://api.sjtuagent.com/v1/responses"
+model = "gpt-6.1-sol"
+review_model = "gpt-6.1-sol"
+api_key_env = "JUDGE_API_KEY"
+actor_authorization = "local-image-extension"
+reasoning_effort = "high"
+max_output_tokens = 8192
+timeout = 180
+retries = 2
+max_calls = 1500
+repair_attempts = 1
+chunk_chars = 8000
+overlap_chars = 600
+max_chunks = 20

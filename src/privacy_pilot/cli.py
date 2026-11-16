@@ -9,6 +9,7 @@ import urllib.error
 from .common import ROOT, PilotError, write_json
 from .config import load_config
 from .evaluation import compare_runs, evaluate, make_audit, split_prepared, verify_result
+from .judge import judge, load_judge_config
 from .pipeline import run
 from .source import download_webis, prepare
 
@@ -42,7 +43,17 @@ def parser() -> argparse.ArgumentParser:
     audit.add_argument("--count", type=int, default=50)
     audit.add_argument("--seed", type=int, default=3602)
     audit.add_argument("--scope", choices=("final", "holdout", "rule_negative"), required=True)
-    score = commands.add_parser("evaluate", help="Compute metrics from completed HUMAN annotations")
+    judging = commands.add_parser("judge", help="Generate blind GPT reference labels via the Responses API")
+    judging.add_argument("--input", type=Path, required=True)
+    judging.add_argument("--output", type=Path, required=True)
+    judging.add_argument("--scope", choices=("final", "holdout", "rule_negative"), required=True)
+    judging.add_argument("--count", type=int, default=50)
+    judging.add_argument("--seed", type=int, default=3602)
+    judging.add_argument("--config", type=Path, default=ROOT / "config/judge.toml")
+    judging.add_argument("--cache", type=Path, default=Path("artifacts/judge-cache-v1"))
+    judging.add_argument("--mode", choices=("resume", "replay", "fresh"), default="resume")
+    judging.add_argument("--prompts", type=Path, default=ROOT / "prompts")
+    score = commands.add_parser("evaluate", help="Compare predictions with human or LLM reference labels; report provenance")
     score.add_argument("--predictions", type=Path, required=True)
     score.add_argument("--gold", type=Path, required=True)
     score.add_argument("--output", type=Path, required=True)
@@ -76,6 +87,12 @@ def main(argv=None) -> int:
                 exit_code = 2
         elif args.command == "audit":
             result = make_audit(args.input, args.output, args.count, args.seed, args.scope)
+        elif args.command == "judge":
+            result = judge(args.input, args.output, load_judge_config(args.config), args.cache, args.mode,
+                           args.count, args.seed, args.scope, args.prompts,
+                           progress=lambda s: print(s, file=sys.stderr, flush=True))
+            if not result["complete"]:
+                exit_code = 2
         elif args.command == "evaluate":
             result = evaluate(args.predictions, args.gold)
             write_json(args.output, result)

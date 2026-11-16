@@ -7,8 +7,8 @@ import unittest
 import urllib.error
 import zipfile
 
-from tests.support import EXAMPLES, annotation, config, raw_fixture, response, transport
-from privacy_pilot.common import PilotError, canonical, digest, jsonl, read_json, write_json, write_jsonl
+from tests.support import annotation, config, raw_fixture, response, transport
+from privacy_pilot.common import PilotError, canonical, jsonl, read_json, write_json, write_jsonl
 from privacy_pilot.config import load_config, validate_config
 from privacy_pilot.evaluation import compare_runs, evaluate, make_audit, split_prepared, verify_result
 from privacy_pilot.model import AuthenticationError, BudgetExceeded, CacheMiss, ModelClient, ModelError

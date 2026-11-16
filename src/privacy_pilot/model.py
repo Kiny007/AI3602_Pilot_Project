@@ -52,6 +52,11 @@ class ModelClient:
 
     def _request(self, messages: list[dict]) -> dict:
         cfg = self.cfg
+        if cfg["provider"] == "responses":
+            return {"model": cfg["name"], "input": messages, "stream": False,
+                    "store": False, "max_output_tokens": cfg["max_tokens"],
+                    "reasoning": {"effort": cfg.get("reasoning_effort", "low")},
+                    "text": {"format": {"type": "json_object"}}}
         request = {"model": cfg["name"], "messages": messages, "stream": False}
         if cfg["provider"] == "ollama":
             request["options"] = {"temperature": cfg["temperature"], "num_predict": cfg["max_tokens"]}
@@ -108,12 +113,14 @@ class ModelClient:
         self.stats["completions"] += 1
         content = self._content(response)
         usage = response.get("usage", {}) if isinstance(response, dict) else {}
-        self.stats["referenced_input_tokens"] += usage.get("prompt_tokens", response.get("prompt_eval_count", 0)) or 0
-        self.stats["referenced_output_tokens"] += usage.get("completion_tokens", response.get("eval_count", 0)) or 0
+        self.stats["referenced_input_tokens"] += usage.get("input_tokens", usage.get("prompt_tokens", response.get("prompt_eval_count", 0))) or 0
+        self.stats["referenced_output_tokens"] += usage.get("output_tokens", usage.get("completion_tokens", response.get("eval_count", 0))) or 0
         return content, key
 
     def _http(self, payload: dict) -> dict:
         headers = {"Content-Type": "application/json", "User-Agent": "AI3602-PrivacyPilot/0.1"}
+        if self.cfg.get("actor_authorization"):
+            headers["x-openai-actor-authorization"] = self.cfg["actor_authorization"]
         variable = self.cfg["api_key_env"]
         if variable and self._api_key is None:
             try:
@@ -136,7 +143,22 @@ class ModelClient:
 
     def _content(self, response: dict) -> str:
         try:
-            if self.cfg["provider"] == "ollama":
+            if self.cfg["provider"] == "responses":
+                if response.get("status") != "completed" or response.get("error") or response.get("incomplete_details"):
+                    raise ModelError("Responses API response incomplete or failed; no partial labels accepted")
+                parts = []
+                for item in response["output"]:
+                    if item.get("type") != "message":
+                        continue
+                    if item.get("status") not in (None, "completed"):
+                        raise ModelError("Responses API message incomplete")
+                    for part in item.get("content", []):
+                        if part.get("type") == "refusal":
+                            raise ModelError("Judge refused the annotation")
+                        if part.get("type") == "output_text":
+                            parts.append(part["text"])
+                content = "".join(parts)
+            elif self.cfg["provider"] == "ollama":
                 if response.get("done") is not True or response.get("done_reason") == "length":
                     raise ModelError("Ollama response incomplete; adjust output budget")
                 content = response["message"]["content"]
@@ -148,5 +170,5 @@ class ModelClient:
             if not isinstance(content, str) or not content.strip():
                 raise ModelError("Model returned no textual annotation")
             return content
-        except (KeyError, IndexError, TypeError):
+        except (KeyError, IndexError, TypeError, AttributeError):
             raise ModelError("Unrecognized provider response structure") from None

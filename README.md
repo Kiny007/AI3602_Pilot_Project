@@ -14,7 +14,7 @@
 
 ***结果***
 
-通过检查的记录导出为 JSONL 和 CSV，再通过人工抽样审计与独立测试集评估质量。
+通过检查的记录导出为 JSONL 和 CSV，再由 GPT 以 LLM-as-a-Judge 方式评估抽样结果和独立测试集。
 
 ***复现***
 
@@ -36,12 +36,13 @@ python -m unittest discover -s tests -v
 
 使用 uv 时，可将 `python run.py` 换成 `uv run run.py`。
 
-## 2. 填写 DeepSeek API Key
+## 2. 配置抽取与判分 API Key
 
 打开项目根目录的 `.env`，填写并保存：
 
 ```dotenv
 DEEPSEEK_API_KEY=在这里填写你的DeepSeek_API_Key
+JUDGE_API_KEY=在这里填写你的GPT_API_Key
 ```
 
 如果还没有 `.env`，先执行：
@@ -58,7 +59,7 @@ Copy-Item .env.example .env
 cp -i .env.example .env
 ```
 
-默认模型和请求地址已写在 `config/default.toml` 中。
+DeepSeek 抽取配置在 `config/default.toml`；GPT 判分配置在 `config/judge.toml`，判分只依据原文，不启用搜索工具。
 
 ## 3. 下载数据
 
@@ -118,6 +119,10 @@ python run.py split --prepared data/prepared/webis-v1 --output data/prepared/spl
 python run.py run --prepared data/prepared/splits-v1/collection --output artifacts/run-v1 --cache artifacts/cache-v1 --mode resume
 ```
 
+>默认 `target_count=0`，处理全部输入；`max_calls=1500` 限制单次执行的 api 请求尝试数，重试也计入。
+
+> 如需先调试，可把 `--prepared` 改为 `data/prepared/splits-v1/dev`，同时换用开发运行目录。
+
 `--output artifacts/run-v1` 指定本次运行结果的保存目录；
 `--cache artifacts/cache-v1` 指定模型请求和响应的缓存目录，首次运行时自动创建。缓存保存请求中的文本、提示词、模型参数和原始响应。缓存主要用于：
 
@@ -131,112 +136,99 @@ python run.py run --prepared data/prepared/splits-v1/collection --output artifac
 | 文件 | 查看内容 |
 |---|---|
 | `privacy_dataset.jsonl` | 通过自动检查的正例，含完整正文、标签、证据和来源 |
-| `privacy_dataset.csv` | 便于浏览的结果摘要 |
+| `privacy_dataset.csv` | 便于浏览的结果 |
 | `predictions.jsonl` | 每条输入的处理状态，包括负例和失败记录 |
 | `summary.json` | 正例数、类别分布、调用统计及完成状态 |
 | `config.snapshot.json`、`prompts/` | 本次配置与提示词快照 |
 | `source_manifest.json`、`cache_index.json` | 来源清单和本次使用的缓存索引 |
 
-检查 `summary.json` 中的 `counts.accepted` 和 `category_coverage`。`count_thresholds_met=true` 表示达到至少 50 条、至少 3 类且未标记为合成数据的数量条件；标签是否正确仍需第 8 步人工审计。
+检查 `summary.json` 中的 `counts.accepted` 和 `category_coverage`。`count_thresholds_met=true` 表示达到 *至少 50 条、至少 3 类且未标记为合成数据* 的数量条件。
 
-默认 `target_count=0`，处理全部输入；`max_calls=1500` 限制单次执行的请求尝试数，重试也计入。预算可能不足以处理全部样本，遇到 `unprocessed_budget` 时按文末方法继续。`complete_analysis=false` 表示还有失败、歧义、跳过或未处理记录，可在 `predictions.jsonl` 中定位。
-
-> 如需先调试，可把 `--prepared` 改为 `data/prepared/splits-v1/dev`，同时换用开发运行目录。
 
 ## 7. 核验来源、证据和数量
 
-Windows（PowerShell）：
+> Windows & Linux
 
-```powershell
+```bash
 python run.py verify --run artifacts/run-v1 --raw-root data/raw --require-minimum --output artifacts/run-v1/verification.json
 ```
 
-Linux（Bash）：
+程序重新计算源文件哈希，核对原文位置、记录 ID、证据偏移和结果数量。
 
+通过时，输出中的 `structurally_valid`、`source_verification.ok` 和 `count_thresholds_met` 均为 `true`，`errors` 为空。
+
+## 8. LLM-as-a-Judge 评估最终数据
+
+使用 GPT 独立判断抽样文本，再与 DeepSeek 的标签比较。默认从最终正例中随机抽取最多 50 条，固定种子为 3602。GPT 只收到原文和标签规范，不会看到 DeepSeek 的标签、理由或预测状态；第二次复核只检查 GPT 自己的判断。
+
+> Windows & Linux
 ```bash
-python3 run.py verify --run artifacts/run-v1 --raw-root data/raw --require-minimum --output artifacts/run-v1/verification.json
+python run.py judge --input artifacts/run-v1/privacy_dataset.jsonl --scope final --count 50 --seed 3602 --output artifacts/judge-final-v1 --cache artifacts/judge-cache-v1 --mode resume
 ```
 
-程序重新计算源文件哈希，核对原文位置、记录 ID、证据偏移和结果数量。通过时，输出中的 `structurally_valid`、`source_verification.ok` 和 `count_thresholds_met` 均为 `true`，`errors` 为空。
+判分使用 `config/judge.toml`，初次判断和复核模型均为 `gpt-6.1-sol`，推理强度单独设置为 `reasoning_effort=high`。结果保存在 `artifacts/judge-final-v1/`：
 
-完整结果写入 `verification.json`。若失败，先按错误信息处理；省略 `--raw-root` 只检查结构，无法核验原始来源。
-
-## 8. 人工审计最终数据
-
-抽取最多 50 条正例，生成不展示模型标签的标注模板：
-
-Windows（PowerShell）：
-
-```powershell
-python run.py audit --input artifacts/run-v1/privacy_dataset.jsonl --scope final --count 50 --seed 3602 --output artifacts/run-v1/evaluation/audit-final.jsonl
-```
-
-Linux（Bash）：
-
-```bash
-python3 run.py audit --input artifacts/run-v1/privacy_dataset.jsonl --scope final --count 50 --seed 3602 --output artifacts/run-v1/evaluation/audit-final.jsonl
-```
-
-输出标注文件和配套的 `.manifest.json`。按照 [标注规范](docs/labeling_guidelines.md) 逐行填写：
-
-| 字段 | 填写方法 |
+| 文件 | 内容 |
 |---|---|
-| `gold_labels` | 人工判断的类别，如 `["AGE", "OCC"]`；无披露填 `[]`，未审阅保留 `null` |
-| `annotation_seconds` | 实际标注耗时，单位秒 |
-| `source_verified` | 回查来源一致填 `true`，不符填 `false`，未核验保留 `null` |
-| `notes` | 错误、边界情况或备注 |
+| `sample.jsonl`、`sample.manifest.json` | 固定抽样的原文、来源、种子和输入哈希 |
+| `judgments.jsonl` | GPT 参考标签、原文证据、判断状态和模型信息 |
+| `summary.json` | 完成数量、失败或歧义数量、调用统计 |
+| `config.snapshot.json`、`prompts/`、`cache_index.json` | 本次判分配置、提示词快照和缓存索引 |
 
-保留原有文本、记录 ID 和来源字段。所有样本完成标注后执行：
-
-Windows（PowerShell）：
-
-```powershell
-python run.py evaluate --predictions artifacts/run-v1/predictions.jsonl --gold artifacts/run-v1/evaluation/audit-final.jsonl --output artifacts/run-v1/evaluation/metrics-final.json
-```
-
-Linux（Bash）：
+`summary.json` 中 `complete=true` 表示全部抽样文本都有明确的参考标签。如果只有 `ok` 和 `needs_review` 两种状态，也可以继续评估：只统计判分明确的记录，将仍有歧义的记录计为 GPT 弃权，保留原始抽样文件。此时 `complete` 仍为 `false`，`judge` 命令会返回退出码 2，但可以单独运行下面的评分命令，无需再次请求 GPT：
 
 ```bash
-python3 run.py evaluate --predictions artifacts/run-v1/predictions.jsonl --gold artifacts/run-v1/evaluation/audit-final.jsonl --output artifacts/run-v1/evaluation/metrics-final.json
+python run.py evaluate --predictions artifacts/run-v1/predictions.jsonl --gold artifacts/judge-final-v1/judgments.jsonl --output artifacts/run-v1/evaluation/metrics-final-gpt.json
 ```
 
-输出文本有效率、标签精确率、标签集合完全正确率及来源核验情况。这些指标只针对最终正例抽样，总体召回率和 F1 使用下一步的独立测试集计算。人工审计不会自动修改已导出的数据。
+输出相对于 GPT 参考标签的文本有效率、标签精确率和标签集合完全一致率。指标带有 `reference_kind=llm_judge`、`reference_is_human=false`，不作为人工标注准确率；仅抽取最终正例也无法计算总体召回率或 F1。沿用的字段名 `gold_labels` 和参数名 `--gold` 在这里表示模型参考标签。
 
-## 9. 评估独立测试集
+评估文件同时记录原始抽样数、实际评分数和弃权情况。例如，50 条样本中有 47 条判分明确、3 条仍有歧义时：
 
-先导出测试集的盲审模板，按第 8 步填写完毕后再查看模型预测：
+| 字段 | 含义 | 示例值 |
+|---|---|---:|
+| `sample_size` | 原始抽样文本数 | 50 |
+| `evaluated_count` | 实际参与指标计算的文本数 | 47 |
+| `judge_coverage` | 明确判分数 / 原始抽样数 | 0.94（94%） |
+| `judge_abstained_count` | GPT 因歧义弃权的文本数 | 3 |
+| `judge_abstention_rate` | GPT 弃权比例 | 0.06（6%） |
 
-Windows（PowerShell）：
+此时文本有效率和集合一致率的分母为 47，标签精确率也只汇总这 47 条中的标签。**报告指标时须同时写明 94% 的判分覆盖率和 3 条弃权，不能将指标当作全部 50 条的结果。** 弃权文本可能更难判断，因此也不能据此假定它们与已评分文本表现相同。`judge_abstentions` 保存弃权记录的 ID 和原因，`metrics_scope=resolved_judgments_only` 标明指标范围；若全部弃权，各项质量比率为 `null`。
 
-```powershell
-python run.py audit --input data/prepared/splits-v1/test/input.jsonl --scope holdout --count 100 --seed 3602 --output artifacts/run-v1/evaluation/gold-test.jsonl
-```
+GPT 仍可能误判，来源真实性由第 7 步核验。判分不改写原始抽取结果，也不填写人工标注耗时或来源核验结论。请求固定 `store=false`，本地仍保留响应缓存用于续跑和复现；这不代表对第三方网关日志策略的保证。判分不使用网页搜索，避免引入原文之外的信息。
 
-Linux（Bash）：
+## 9. LLM-as-a-Judge 评估独立测试集
+
+使用第 5 步保留的 100 条测试文本，包含正例与负例。GPT 判分会处理全部抽样文本，不使用 DeepSeek 的规则过滤：
 
 ```bash
-python3 run.py audit --input data/prepared/splits-v1/test/input.jsonl --scope holdout --count 100 --seed 3602 --output artifacts/run-v1/evaluation/gold-test.jsonl
+python run.py judge --input data/prepared/splits-v1/test/input.jsonl --scope holdout --count 100 --seed 3602 --output artifacts/judge-test-v1 --cache artifacts/judge-cache-v1 --mode resume
 ```
 
-用正式运行时的配置和提示词处理测试集，再计算指标：
+随后使用正式抽取时的 DeepSeek 配置和提示词处理同一测试集，并与 GPT 参考标签比较：
 
-Windows（PowerShell）：
-
-```powershell
+```bash
 python run.py run --prepared data/prepared/splits-v1/test --config artifacts/run-v1/config.snapshot.json --prompts artifacts/run-v1/prompts --output artifacts/test-v1 --cache artifacts/cache-v1 --mode resume
-python run.py evaluate --predictions artifacts/test-v1/predictions.jsonl --gold artifacts/run-v1/evaluation/gold-test.jsonl --output artifacts/run-v1/evaluation/metrics-test.json
+python run.py evaluate --predictions artifacts/test-v1/predictions.jsonl --gold artifacts/judge-test-v1/judgments.jsonl --output artifacts/run-v1/evaluation/metrics-test-gpt.json
 ```
 
-Linux（Bash）：
+`metrics-test-gpt.json` 包含相对于 GPT 参考标签的 Micro Precision、Recall、F1、各类别指标和标签集合完全一致率。分母为零时返回 `null`。这些结果衡量两个模型在固定标签规范下的差异，不等于人工验证后的真实准确率。
+
+测试配置须保持 `target_count=0`，测试集不用于调参。对 GPT 已明确判分的文本，抽取端的 `needs_review` 作为无预测标签处理，参考标签中的对应类别计为漏检；`abstained_count` 记录这些抽取端弃权。GPT 判分端的 `needs_review` 则由 `judge_abstained_count` 单独统计，不参与质量指标计算，也不当作负例。测试集同样须同时报告判分覆盖率、弃权数和实际评分数，指标仅适用于明确判分的子集。
+
+拒答、无效证据、预算耗尽或其他失败不属于上述歧义弃权，仍会阻止评分。评分也会校验弃权记录的文本、来源、证据和预测是否完整，不通过删除记录来绕过检查。
+
+### GPT 判分续跑与离线复现
+
+判分输出目录必须是新目录。中断或预算耗尽后，保留 `judge-cache-v1`，以原配置、提示词和抽样参数重跑：
 
 ```bash
-python3 run.py run --prepared data/prepared/splits-v1/test --config artifacts/run-v1/config.snapshot.json --prompts artifacts/run-v1/prompts --output artifacts/test-v1 --cache artifacts/cache-v1 --mode resume
-python3 run.py evaluate --predictions artifacts/test-v1/predictions.jsonl --gold artifacts/run-v1/evaluation/gold-test.jsonl --output artifacts/run-v1/evaluation/metrics-test.json
+python run.py judge --input artifacts/run-v1/privacy_dataset.jsonl --scope final --count 50 --seed 3602 --config artifacts/judge-final-v1/config.snapshot.json --prompts artifacts/judge-final-v1/prompts --output artifacts/judge-final-v2 --cache artifacts/judge-cache-v1 --mode resume
 ```
 
-`metrics-test.json` 包含 Micro Precision、Recall、F1 和各类别指标；分母为零时对应值为 `null`。测试配置须保持 `target_count=0`。未完成的人工标签、缺失预测或调用失败会导致评估报错，需补齐后重算。`needs_review` 按弃权处理，金标中的相应类别计为漏检。
+每次执行重新计算请求次数额度，默认上限 1,500，初次判断、复核、修复和 HTTP 重试共用这份额度。续跑可能继续产生费用；已缓存的错误响应不会因重跑自动变正确，持续歧义或校验失败需要检查提示词、输出长度等设置后，使用新目录记录修订实验。
 
-测试集不用于调参。
+缓存完整时，将 `--mode resume` 改成 `--mode replay` 并使用新输出目录，即可离线重放判分。参考标签、证据和请求轨迹应一致，`judge_seconds` 等耗时可以不同；`compare` 命令只用于第 10 步的抽取结果，不用于判分目录。测试集判分续跑时对应替换输入路径、`scope=holdout`、`count=100` 和快照目录。使用新判分结果后，`evaluate --gold` 也要指向新的 `judgments.jsonl`。
 
 ## 10. 离线重放并比较结果
 
@@ -258,6 +250,8 @@ python3 run.py compare artifacts/run-v1 artifacts/replay-v1
 
 使用相同代码、输入、配置及提示词时，比较结果应为 `"identical_bytes": true`，表示最终 `privacy_dataset.jsonl` 逐字节一致。耗时、缓存命中等运行统计可以不同。若正式运行尚有未处理记录，应先完成运行再重放。
 
+---
+
 ## 中断恢复与常见问题
 
 | 情况 | 处理方法 |
@@ -265,7 +259,7 @@ python3 run.py compare artifacts/run-v1 artifacts/replay-v1
 | 下载中断，有 `.part` 文件 | 重复执行原 `download` 命令，尝试续传 |
 | 需要从头下载 | 在 `download` 命令后加 `--restart`，程序先备份旧片段 |
 | 完整 ZIP 校验失败 | 保留文件，换输出路径重新下载或传输 |
-| `prepare`、`split` 或 `run` 提示输出目录已存在 | 换用新目录，例如将 `v1` 改成 `v2` |
+| `prepare`、`split`、`run` 或 `judge` 提示输出目录已存在 | 换用新目录，例如将 `v1` 改成 `v2` |
 | API 鉴权失败 | 检查 `.env` 和同名环境变量；环境变量优先 |
 | 运行中断或出现 `unprocessed_budget` | 使用原缓存、新输出目录，以 `resume` 模式重跑 |
 | `replay` 缺少缓存 | 找回该次运行的完整缓存，或用 `resume` 补充模型调用后重新核验 |

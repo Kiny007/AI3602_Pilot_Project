@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 import random
+import math
 
 from .common import TAGS, PilotError, canonical, digest, file_hash, jsonl, new_directory, write_json, write_jsonl
 from .rules import normalized
@@ -82,16 +83,59 @@ def evaluate(predictions_file: Path, gold_file: Path) -> dict:
     scope = scopes.pop()
     if scope not in ("final", "holdout", "rule_negative"):
         raise PilotError("Unknown annotation scope")
+    kinds = {r.get("reference_kind", "human") for r in gold}
+    if len(kinds) != 1 or not kinds <= {"human", "llm_judge"}:
+        raise PilotError("Do not mix human and LLM reference labels or unknown reference kinds")
+    reference_kind = kinds.pop()
+    is_judge = reference_kind == "llm_judge"
+    judge_info = None
+    if is_judge:
+        judge_info = gold[0].get("judge")
+        if not isinstance(judge_info, dict) or judge_info.get("blind") is not True or not judge_info.get("model"):
+            raise PilotError("Missing blind judge provenance")
+        if any(r.get("judge") != judge_info for r in gold):
+            raise PilotError("Mixed judge provenance")
+        if any(r.get("judge_status") not in ("ok", "needs_review") for r in gold):
+            raise PilotError("Failed or unfinished judgments; only needs_review may count as judge abstention")
     per_class = {tag: Counter() for tag in TAGS}
     exact = positive = verified = reviewed_sources = abstained = 0
     total_seconds = 0.0
+    judge_abstentions = []
     for row in gold:
+        judge_abstained = is_judge and row["judge_status"] == "needs_review"
         labels = row.get("gold_labels")
-        if not isinstance(labels, list) or any(t not in TAGS for t in labels) or len(set(labels)) != len(labels):
+        if judge_abstained:
+            if labels is not None:
+                raise PilotError("Abstaining judge must leave gold_labels null")
+        elif not isinstance(labels, list) or any(t not in TAGS for t in labels) or len(set(labels)) != len(labels):
             raise PilotError(f"Finish gold_labels using a unique label list ([] for negative): {row['record_id']}")
-        elapsed = row.get("annotation_seconds")
-        if type(elapsed) not in (int, float) or elapsed < 0:
-            raise PilotError("Fill annotation_seconds with the actual nonnegative time")
+        time_field = "judge_seconds" if is_judge else "annotation_seconds"
+        elapsed = row.get(time_field)
+        if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
+            raise PilotError(f"Fill {time_field} with the actual finite nonnegative time")
+        if is_judge and (row.get("source_verified") is not None or row.get("annotation_seconds") is not None):
+            raise PilotError("LLM judgments must not claim human annotation time or source verification")
+        if is_judge:
+            from .schema import AnnotationError, parse_annotation
+            evidence = row.get("judge_evidence")
+            if not isinstance(evidence, list) or any(not isinstance(f, dict) for f in evidence):
+                raise PilotError("Missing judge evidence")
+            annotation = {"has_privacy": bool(labels), "review_required": False,
+                          "findings": [{k: v for k, v in f.items() if k not in ("start", "end")} for f in evidence]}
+            # Evidence may repeat elsewhere in a long full text; offsets were verified per chunk.
+            if not judge_abstained and set(labels) != {f.get("tag") for f in evidence}:
+                raise PilotError("Judge labels do not match evidence")
+            for f, finding in zip(evidence, annotation["findings"]):
+                start, end = f.get("start"), f.get("end")
+                if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(row["text"]):
+                    raise PilotError("Invalid judge evidence offset")
+                if row["text"][start:end] != f.get("evidence"):
+                    raise PilotError("Judge evidence does not match its original text span")
+                try:
+                    parse_annotation(canonical({"has_privacy": True, "review_required": False, "findings": [finding]}),
+                                     row["text"][start:end])
+                except AnnotationError as e:
+                    raise PilotError("Invalid judge evidence: " + str(e)) from e
         total_seconds += elapsed
         pred = predictions.get(row["record_id"])
         if pred is None:
@@ -105,6 +149,9 @@ def evaluate(predictions_file: Path, gold_file: Path) -> dict:
         predicted = pred.get("privacy_tag")
         if not isinstance(predicted, list) or any(t not in TAGS for t in predicted) or len(predicted) != len(set(predicted)):
             raise PilotError("Invalid predicted label list")
+        if judge_abstained:
+            judge_abstentions.append({"record_id": row["record_id"], "reason": "needs_review"})
+            continue
         target, actual = set(labels), set(predicted)
         exact += target == actual
         positive += bool(target)
@@ -125,8 +172,10 @@ def evaluate(predictions_file: Path, gold_file: Path) -> dict:
     for value in per_class.values():
         sums.update(value)
     all_metrics = metrics(sums["tp"], sums["fp"], sums["fn"])
-    result = {"scope": scope, "sample_size": len(gold), "gold_positive_count": positive,
-              "positive_fraction": positive / len(gold), "exact_match": exact / len(gold),
+    evaluated_count = len(gold) - len(judge_abstentions)
+    result = {"scope": scope, "sample_size": len(gold), "evaluated_count": evaluated_count,
+              "gold_positive_count": positive,
+              "positive_fraction": ratio(positive, evaluated_count), "exact_match": ratio(exact, evaluated_count),
               "abstained_count": abstained, "annotation_seconds": total_seconds,
               "source_verified": verified, "source_reviewed": reviewed_sources,
               "source_verification_rate": ratio(verified, reviewed_sources),
@@ -135,12 +184,31 @@ def evaluate(predictions_file: Path, gold_file: Path) -> dict:
     if scope == "holdout":
         result["micro"] = all_metrics
         result["per_class"] = {tag: metrics(c["tp"], c["fp"], c["fn"]) for tag, c in per_class.items()}
-        result["note"] = "Abstentions count as no predicted labels; holdout must not have been used for tuning."
+        result["note"] = "Extraction abstentions count as no predicted labels among evaluated records; holdout must not have been used for tuning."
     elif scope == "final":
-        result["text_validity_rate"] = positive / len(gold)
+        result["text_validity_rate"] = ratio(positive, evaluated_count)
         result["note"] = "Final-positive audit only; no population recall or F1 is claimed."
     else:
         result["note"] = "Positive fraction estimates missed disclosures within rule-negative stratum, not population recall."
+    result["reference_kind"] = reference_kind
+    result["reference_is_human"] = not is_judge
+    if is_judge:
+        result["judge_coverage"] = ratio(evaluated_count, len(gold))
+        result["judge_abstained_count"] = len(judge_abstentions)
+        result["judge_abstention_rate"] = ratio(len(judge_abstentions), len(gold))
+        result["judge_abstentions"] = judge_abstentions
+        result["metrics_scope"] = "resolved_judgments_only"
+        result["judge"] = judge_info
+        result["judge_seconds"] = result.pop("annotation_seconds")
+        result.pop("source_verified")
+        result.pop("source_reviewed")
+        result.pop("source_verification_rate")
+        result["note"] += " Metrics are relative to LLM reference labels, not human-validated accuracy; no factual source verification is claimed."
+        result["note"] += (f" Metrics use only {evaluated_count} resolved judgments out of {len(gold)} sampled records;"
+                           f" {len(judge_abstentions)} judge abstentions are excluded, not treated as negatives."
+                           " When coverage is below 100%, these scores do not represent the entire sample."
+                           " abstained_count counts extraction abstentions within evaluated records;"
+                           " judge_seconds includes all sampled records.")
     return result
 
 

@@ -101,7 +101,7 @@ class CLIIntegrationTests(TemporaryCase):
         self.assertIn("model.name", result.stderr)
         self.assertFalse((self.root / "out").exists())
 
-    def test_cli_replay_verify_and_evaluate_unfilled(self):
+    def test_cli_replay_compare_and_verify(self):
         self.run_fixture()
         result = self.command("run", "--prepared", self.root / "prepared", "--config", self.root / "run/config.snapshot.json",
                               "--prompts", self.root / "run/prompts", "--output", self.root / "replay",
