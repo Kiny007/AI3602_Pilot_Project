@@ -1,0 +1,9 @@
+[project]
+name = "reddit-privacy-pilot"
+version = "0.1.0"
+description = "Evidence-grounded Reddit privacy disclosure mining for AI3602"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false

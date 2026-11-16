@@ -1,0 +1,38 @@
+# Paths are supplied on the command line. Copy to config/local.toml for changes.
+[source]
+dataset = "Webis-TLDR-17"
+version = "zenodo-1043504-v1"
+url = "https://zenodo.org/records/1043504"
+kind = "public_dataset"
+text_field = "body"
+id_field = "id"
+start = 0
+limit = 5000
+subreddits = []
+synthetic = false
+
+[model]
+provider = "deepseek"
+# Ready to use; enter your key in the project-root .env file.
+endpoint = "https://api.deepseek.com/chat/completions"
+name = "deepseek-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+temperature = 0.0
+max_tokens = 2048
+json_mode = true
+timeout = 90
+retries = 2
+max_calls = 1500
+
+[pipeline]
+review = true
+repair_attempts = 1
+chunk_chars = 8000
+overlap_chars = 600
+max_chunks = 20
+rules = true
+# 0 processes the entire prepared range. Use 100 for early-stop collection.
+# Early-stop outputs are unsuitable for full-population recall evaluation.
+target_count = 0
+min_classes = 3
+min_per_class = 10
